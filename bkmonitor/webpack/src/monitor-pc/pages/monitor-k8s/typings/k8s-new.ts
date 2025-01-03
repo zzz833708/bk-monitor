@@ -120,6 +120,7 @@ export interface IK8SMetricItem {
   count?: number;
   unit?: string;
   children: IK8SMetricItem[];
+  unsupported_resource?: string[];
 }
 
 export const K8SPerformanceMetricUnitMap = {

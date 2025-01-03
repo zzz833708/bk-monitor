@@ -26,7 +26,6 @@
 import { Prop, Component, Emit, Watch, InjectReactive, Inject } from 'vue-property-decorator';
 import { Component as tsc } from 'vue-tsx-support';
 
-import { connect, disconnect } from 'echarts/core';
 import { listK8sResources, resourceTrend } from 'monitor-api/modules/k8s';
 import { Debounce, random } from 'monitor-common/utils/utils';
 import loadingIcon from 'monitor-ui/chart-plugins/icons/spinner.svg';
@@ -85,7 +84,7 @@ export type K8sTableRow = Partial<Record<K8sTableColumnResourceKey, string>> &
   Record<K8sTableColumnChartKey, Pick<ITableItemMap, 'datapoints'>['datapoints']>;
 
 export interface K8sTableSort {
-  prop: K8sTableColumnResourceKey | null;
+  prop: K8sTableColumnChartKey | null;
   order: 'ascending' | 'descending' | null;
 }
 
@@ -117,6 +116,7 @@ interface K8sTableNewProps {
   hideMetrics: string[];
 }
 interface K8sTableNewEvent {
+  onSortChange: (sort: `-${K8sTableColumnChartKey}` | K8sTableColumnChartKey) => void;
   onClearSearch: () => void;
 }
 
@@ -268,20 +268,24 @@ export default class K8sTableNew extends tsc<K8sTableNewProps, K8sTableNewEvent>
 
   /** 缩略图分组Id枚举 */
   get chartGroupIdsMap() {
-    return this.tableColumns.reduce((acc, cur, ind) => {
-      if (cur.type === K8sTableColumnTypeEnum.DATA_CHART) {
-        if (acc[cur.id]) disconnect(acc[cur.id]);
-        acc[cur.id] = `${random(8)}_${ind}`;
-        connect(acc[cur.id]);
-      }
-      return acc;
-    }, {});
+    // 暂时不支持图表联动
+    // return this.tableColumns.reduce((acc, cur, ind) => {
+    //   if (cur.type === K8sTableColumnTypeEnum.DATA_CHART) {
+    //     if (acc[cur.id]) disconnect(acc[cur.id]);
+    //     acc[cur.id] = `${random(8)}_${ind}`;
+    //     connect(acc[cur.id]);
+    //   }
+    //   return acc;
+    // }, {});
+    return {};
   }
 
   /** table 空数据时显示样式类型 'search-empty'/'empty' */
   get tableEmptyType() {
-    if (this.filterBy?.length) {
-      return 'search-empty';
+    for (const filtersArgs of Object.values(this.filterBy)) {
+      if (filtersArgs?.length) {
+        return 'search-empty';
+      }
     }
     return 'empty';
   }
@@ -294,12 +298,24 @@ export default class K8sTableNew extends tsc<K8sTableNewProps, K8sTableNewEvent>
     }
   }
 
-  @Watch('groupInstance.groupFilters')
-  onGroupFiltersChange() {
-    if (!this.isListTab || !this.filterCommonParams.bcs_cluster_id) return;
+  @Watch('groupInstance', { deep: true })
+  onGroupFiltersChange(newInstance, oldInstance) {
+    if (!this.filterCommonParams.bcs_cluster_id) {
+      return;
+    }
+    if (newInstance === oldInstance) {
+      if (!this.isListTab) return;
+      this.tableLoading.loading = true;
+      this.debounceGetK8sList();
+      return;
+    }
+    this.initSortContainer(this.groupInstance.defaultSortProp);
+    this.sortChange(this.groupInstance.defaultSortProp);
     this.tableLoading.loading = true;
     this.debounceGetK8sList();
+    this.refreshTable();
   }
+
   @Watch('filterCommonParams')
   onFilterCommonParamsChange() {
     this.debounceGetK8sList();
@@ -315,12 +331,19 @@ export default class K8sTableNew extends tsc<K8sTableNewProps, K8sTableNewEvent>
     this.getK8sList({ needRefresh: true });
   }
 
+  @Emit('sortChange')
+  sortChange(sort: `-${K8sTableColumnChartKey}` | K8sTableColumnChartKey) {
+    return sort;
+  }
+
   @Emit('clearSearch')
   clearSearch() {
     return {};
   }
 
   created() {
+    const orderBy = (this.$route.query?.tableSort as string) || this.groupInstance.defaultSortProp;
+    this.initSortContainer(orderBy as `-${K8sTableColumnChartKey}` | K8sTableColumnChartKey);
     this.getK8sList();
   }
   beforeUnmount() {
@@ -349,7 +372,7 @@ export default class K8sTableNew extends tsc<K8sTableNewProps, K8sTableNewEvent>
         type: K8sTableColumnTypeEnum.RESOURCES_TEXT,
         min_width: 260,
         canClick: true,
-        k8s_filter: false,
+        k8s_filter: this.isListTab,
         k8s_group: this.isListTab,
       },
       [WORKLOAD_TYPE]: {
@@ -416,6 +439,17 @@ export default class K8sTableNew extends tsc<K8sTableNewProps, K8sTableNewEvent>
     this.refreshKey = random(10);
   }
 
+  /**
+   * @description 初始化排序
+   * @param {string} orderBy 排序字段
+   */
+  initSortContainer(orderBy: `-${K8sTableColumnChartKey}` | K8sTableColumnChartKey) {
+    const matchReg = orderBy?.match(/^(-?)(\w+)$/) || [];
+    this.sortContainer.prop = (matchReg?.[2] || '') as K8sTableColumnChartKey;
+    this.sortContainer.order = matchReg?.[1] === '-' ? 'descending' : 'ascending';
+    this.sortContainer.initDone = false;
+  }
+
   @Debounce(200)
   debounceGetK8sList() {
     this.getK8sList({ needRefresh: true });
@@ -429,22 +463,14 @@ export default class K8sTableNew extends tsc<K8sTableNewProps, K8sTableNewEvent>
     if (!this.filterCommonParams.bcs_cluster_id || this.tableLoading.scrollLoading) {
       return;
     }
-    if (this.abortControllerQueue.size) {
-      for (const controller of this.abortControllerQueue) {
-        controller.abort();
-      }
-      this.abortControllerQueue.clear();
-    }
-    if (this.requestIdleCallbackId) {
-      cancelIdleCallback(this.requestIdleCallbackId);
-      this.requestIdleCallbackId = null;
-    }
+    this.abortAsyncData();
     let loadingKey = 'scrollLoading';
     const initPagination = () => {
       this.pagination.page = 1;
       loadingKey = 'loading';
     };
     let pageRequestParam = {};
+    // 是否启用前端分页
     if (enabledFrontendLimit) {
       initPagination();
     } else {
@@ -456,14 +482,9 @@ export default class K8sTableNew extends tsc<K8sTableNewProps, K8sTableNewEvent>
         page: this.pagination.page,
       };
     }
+
     this.tableLoading[loadingKey] = true;
     if (config.needRefresh) {
-      this.sortContainer = {
-        prop: K8sTableColumnKeysEnum.CPU,
-        order: 'descending',
-        /** 处理 table 设置了 default-sort 时导致初始化时会自动走一遍sort-change事件问题 */
-        initDone: false,
-      };
       this.asyncDataCache.clear();
     }
     const order_by =
@@ -490,19 +511,17 @@ export default class K8sTableNew extends tsc<K8sTableNewProps, K8sTableNewEvent>
     const resourceParam = this.formatTableData(data.items, resourceType as K8sTableColumnResourceKey);
     this.tableData = data.items;
     this.tableDataTotal = data.count;
-    if (config.needRefresh) {
-      this.refreshTable();
-      this.asyncDataCache.clear();
-    }
     this.tableLoading[loadingKey] = false;
     this.loadAsyncData(resourceType, resourceParam);
   }
+
   getResourceId(key: K8sTableColumnKeysEnum, data: Record<K8sTableColumnKeysEnum, string>) {
     if (key === K8sTableColumnKeysEnum.CONTAINER) {
       return `${data[K8sTableColumnKeysEnum.POD]}:${data[K8sTableColumnKeysEnum.CONTAINER]}`;
     }
     return data[key];
   }
+
   /**
    * @description 格式化接口数据结构为table需要的数据结构，并返回异步请求加载 图表数据 时需要数据
    */
@@ -510,7 +529,6 @@ export default class K8sTableNew extends tsc<K8sTableNewProps, K8sTableNewEvent>
     tableData: K8sTableRow[],
     resourceType: K8sTableColumnResourceKey
   ): { ids: Set<string>; tableDataMap: Record<string, number[]> } {
-    console.info('tableData', tableData, resourceType);
     return tableData.reduce(
       (prev, curr, index) => {
         const id = this.getResourceId(resourceType, curr as any);
@@ -527,10 +545,14 @@ export default class K8sTableNew extends tsc<K8sTableNewProps, K8sTableNewEvent>
         curr[K8sTableColumnKeysEnum.CPU] = {
           datapoints: null,
           unit: '',
+          unitDecimal: null,
+          valueTitle: this.$tc('用量'),
         };
         curr[K8sTableColumnKeysEnum.INTERNAL_MEMORY] = {
           datapoints: null,
           unit: '',
+          unitDecimal: null,
+          valueTitle: this.$tc('用量'),
         };
         if (prev.tableDataMap[id]) {
           prev.tableDataMap[id].push(index);
@@ -544,6 +566,24 @@ export default class K8sTableNew extends tsc<K8sTableNewProps, K8sTableNewEvent>
       },
       { ids: new Set() as Set<string>, tableDataMap: {} }
     );
+  }
+
+  /**
+   * @description 終止目前还在执行的异步列处理逻辑（请求与渲染）
+   */
+  abortAsyncData() {
+    // 如请求资源列表时候，发现视图趋势接口未完成，则中断不请求
+    if (this.abortControllerQueue.size) {
+      for (const controller of this.abortControllerQueue) {
+        controller.abort();
+      }
+      this.abortControllerQueue.clear();
+    }
+    // 如请求资源列表时候，发现异步渲染未全部完成，则中断
+    if (this.requestIdleCallbackId) {
+      cancelIdleCallback(this.requestIdleCallbackId);
+      this.requestIdleCallbackId = null;
+    }
   }
 
   /**
@@ -567,7 +607,7 @@ export default class K8sTableNew extends tsc<K8sTableNewProps, K8sTableNewEvent>
             )
           ),
         },
-        { signal: controller.signal }
+        { signal: controller.signal, needMessage: false }
       )
         .then(tableAsyncData => {
           this.renderTableBatchByBatch(
@@ -625,7 +665,7 @@ export default class K8sTableNew extends tsc<K8sTableNewProps, K8sTableNewEvent>
             /** 控制浏览器一帧内空闲时间足够的情况下最多应可渲染多少条数据
              * （step > canRenderMaxCount 时以step为准，但是一帧内只会执行 1 次）
              **/
-            let canRenderMaxCount = 6;
+            let canRenderMaxCount = 4;
             canRenderMaxCount -= step;
             while (deadline.timeRemaining() > 0 && !shouldBreak && canRenderMaxCount > 0 && !deadline.didTimeout) {
               const res = setData(endIndex, false, step);
@@ -639,15 +679,22 @@ export default class K8sTableNew extends tsc<K8sTableNewProps, K8sTableNewEvent>
               });
             }
           },
-          { timeout: 300 }
+          { timeout: 360 }
         );
       } else {
         return { shouldBreak, endIndex };
       }
     };
-    requestAnimationFrame(() => {
-      setData(0, true, 2);
-    });
+
+    // 递归渲染入口
+    this.requestIdleCallbackId = requestIdleCallback(
+      () => {
+        requestAnimationFrame(() => {
+          setData(0, true, 2);
+        });
+      },
+      { timeout: 360 }
+    );
   }
 
   /**
@@ -684,6 +731,9 @@ export default class K8sTableNew extends tsc<K8sTableNewProps, K8sTableNewEvent>
     }
     this.sortContainer.prop = sortItem.prop;
     this.sortContainer.order = sortItem.order;
+    const orderBy: `-${K8sTableColumnChartKey}` | K8sTableColumnChartKey =
+      this.sortContainer.order === 'descending' ? `-${this.sortContainer.prop}` : this.sortContainer.prop;
+    this.sortChange(orderBy);
     this.getK8sList();
   }
 
@@ -815,15 +865,15 @@ export default class K8sTableNew extends tsc<K8sTableNewProps, K8sTableNewEvent>
           />
         );
       }
-      return chartData?.datapoints.length ? (
+      return chartData?.datapoints?.length ? (
         <MiniTimeSeries
-          data={chartData?.datapoints || []}
+          data={chartData?.datapoints}
           disableHover={true}
           groupId={this.chartGroupIdsMap[column.id]}
           lastValueWidth={80}
           unit={chartData.unit}
           unitDecimal={chartData?.unitDecimal || 4}
-          valueTitle={chartData.valueTitle}
+          valueTitle={chartData.valueTitle || this.$tc('用量')}
         />
       ) : (
         '--'
@@ -868,10 +918,12 @@ export default class K8sTableNew extends tsc<K8sTableNewProps, K8sTableNewEvent>
           style={{ display: !this.tableLoading.loading ? 'block' : 'none' }}
           height='100%'
           default-sort={{
-            prop: K8sTableColumnKeysEnum.CPU,
-            order: 'descending',
+            prop: this.sortContainer.prop,
+            order: this.sortContainer.order,
           }}
+          border={false}
           data={this.tableViewData}
+          outer-border={false}
           // row-key={this.tableRowKey}
           size='small'
           on-scroll-end={this.handleTableScrollEnd}

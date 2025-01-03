@@ -41,6 +41,7 @@ import K8sLeftPanel from './components/k8s-left-panel/k8s-left-panel';
 import K8sMetricList from './components/k8s-left-panel/k8s-metric-list';
 import K8sNavBar from './components/k8s-nav-bar/K8s-nav-bar';
 import K8sTableNew, {
+  type K8sTableColumnChartKey,
   type K8sTableColumnResourceKey,
   type K8sTableGroupByEvent,
 } from './components/k8s-table-new/k8s-table-new';
@@ -61,17 +62,17 @@ import './monitor-k8s-new.scss';
 const HIDE_METRICS_KEY = 'monitor_hide_metrics';
 const tabList = [
   {
-    label: '列表',
+    label: window.i18n.t('K8s对象列表'),
     id: K8sNewTabEnum.LIST,
     icon: 'icon-mc-list',
   },
   {
-    label: '图表',
+    label: window.i18n.t('指标视图'),
     id: K8sNewTabEnum.CHART,
     icon: 'icon-mc-two-column',
   },
   {
-    label: '数据明细',
+    label: window.i18n.t('K8s集群数据详情'),
     id: K8sNewTabEnum.DETAIL,
     icon: 'icon-mingxi',
   },
@@ -102,6 +103,7 @@ export default class MonitorK8sNew extends Mixins(UserConfigMixin) {
   activeTab = K8sNewTabEnum.LIST;
   filterBy: Record<string, string[]> = {};
   // Group By 选择器的值
+  @ProvideReactive('groupInstance')
   groupInstance: K8sGroupDimension = new K8sPerformanceGroupDimension();
 
   // 是否展示取消下钻
@@ -125,12 +127,40 @@ export default class MonitorK8sNew extends Mixins(UserConfigMixin) {
   dimensionTotal: Record<string, number> = {};
 
   cacheTimeRange = [];
+
+  resizeObserver = null;
+  headerHeight = 102;
+
   get isChart() {
     return this.activeTab === K8sNewTabEnum.CHART;
   }
 
   get groupFilters() {
     return this.groupInstance.groupFilters;
+  }
+
+  // 禁用的指标列表
+  get disabledMetricList(): { id: string; tooltips: string }[] {
+    /** 最后一级维度 */
+    const lastDimension = this.groupInstance.getResourceType();
+    const disabledMetricList = [];
+    for (const metrics of this.metricList) {
+      for (const metric of metrics.children) {
+        if ((metric.unsupported_resource || []).includes(lastDimension)) {
+          disabledMetricList.push({
+            id: metric.id,
+            tooltips: this.$t('该指标在当前级别({0})不可用', [lastDimension]),
+          });
+        }
+      }
+    }
+    return disabledMetricList;
+  }
+
+  /** 最终需要隐藏的指标项， 需要通过用户配置以及groupBy选择两种一起判断 */
+  get resultHideMetrics(): string[] {
+    const set = new Set<string>([...this.hideMetrics, ...this.disabledMetricList.map(item => item.id)]);
+    return Array.from(set);
   }
 
   /** 当前场景下的维度列表 */
@@ -187,7 +217,7 @@ export default class MonitorK8sNew extends Mixins(UserConfigMixin) {
     this.setRouteParams();
   }
 
-  @Watch('filterBy')
+  @Watch('filterBy', { deep: true })
   watchFilterByChange() {
     this.setRouteParams();
   }
@@ -220,16 +250,18 @@ export default class MonitorK8sNew extends Mixins(UserConfigMixin) {
     this.showCancelDrill = false;
     if (!this.filterBy[dimensionId]) this.filterBy[dimensionId] = [];
     if (isSelect) {
+      if (!this.groupInstance.hasGroupFilter(dimensionId as K8sTableColumnResourceKey)) {
+        this.groupByChange(dimensionId, true);
+      }
       /** workload维度只能选择一项 */
       if (dimensionId === EDimensionKey.workload) {
         this.filterBy[dimensionId] = [id];
-      } else {
+      } else if (!this.filterBy[dimensionId].includes(id)) {
         this.filterBy[dimensionId].push(id);
       }
     } else {
       this.filterBy[dimensionId] = this.filterBy[dimensionId].filter(item => item !== id);
     }
-    this.filterBy = { ...this.filterBy };
   }
 
   created() {
@@ -239,7 +271,21 @@ export default class MonitorK8sNew extends Mixins(UserConfigMixin) {
     this.handleGetUserConfig(`${HIDE_METRICS_KEY}_${this.scene}`).then((res: string[]) => {
       this.hideMetrics = res || [];
     });
-    this.setRouteParams();
+  }
+
+  mounted() {
+    this.resizeObserver = new ResizeObserver(entries => {
+      for (const entry of entries) {
+        const height = entry?.contentRect?.height || 50;
+        this.headerHeight = 52 + height;
+      }
+    });
+    const el = this.$el.querySelector('.____monitor-k8s-new-header');
+    this.resizeObserver.observe(el);
+  }
+
+  destroyed() {
+    this.resizeObserver.disconnect();
   }
 
   /** 初始化filterBy结构 */
@@ -269,6 +315,7 @@ export default class MonitorK8sNew extends Mixins(UserConfigMixin) {
     if (this.clusterList.length) {
       this.cluster = this.clusterList[0].id;
     }
+    this.setRouteParams();
   }
 
   /**
@@ -378,6 +425,7 @@ export default class MonitorK8sNew extends Mixins(UserConfigMixin) {
     this.groupInstance.setGroupFilters([K8sTableColumnKeysEnum.NAMESPACE]);
     this.showCancelDrill = false;
     this.getScenarioMetricList();
+    this.setRouteParams();
   }
 
   /**
@@ -392,6 +440,16 @@ export default class MonitorK8sNew extends Mixins(UserConfigMixin) {
   handleGroupChecked(groupId: K8sTableColumnResourceKey) {
     this.showCancelDrill = false;
     this.setGroupFilters(groupId, { single: true });
+  }
+
+  /**
+   * @description 表格 sort 排序事件后回调，将排序信息存入路由
+   */
+  handleTableSortChange(sort: `-${K8sTableColumnChartKey}` | K8sTableColumnChartKey) {
+    if (!sort) {
+      return;
+    }
+    this.setRouteParams({ tableSort: sort });
   }
 
   handleTableClearSearch() {
@@ -435,8 +493,9 @@ export default class MonitorK8sNew extends Mixins(UserConfigMixin) {
     }
   }
 
-  setRouteParams() {
+  setRouteParams(otherQuery = {}) {
     const query = {
+      ...this.$route.query,
       sceneId: 'kubernetes',
       from: this.timeRange[0],
       to: this.timeRange[1],
@@ -446,6 +505,7 @@ export default class MonitorK8sNew extends Mixins(UserConfigMixin) {
       cluster: this.cluster,
       scene: this.scene,
       activeTab: this.activeTab,
+      ...otherQuery,
     };
 
     const targetRoute = this.$router.resolve({
@@ -468,7 +528,7 @@ export default class MonitorK8sNew extends Mixins(UserConfigMixin) {
             activeMetricId={this.activeMetricId}
             filterCommonParams={this.filterCommonParams}
             groupBy={this.groupFilters}
-            hideMetrics={this.hideMetrics}
+            hideMetrics={this.resultHideMetrics}
             metricList={this.metricList}
             onDrillDown={this.handleTableGroupChange}
           />
@@ -480,9 +540,10 @@ export default class MonitorK8sNew extends Mixins(UserConfigMixin) {
             filterBy={this.filterBy}
             filterCommonParams={this.tableCommonParam}
             groupInstance={this.groupInstance}
-            hideMetrics={this.hideMetrics}
+            hideMetrics={this.resultHideMetrics}
             metricList={this.metricList}
             onClearSearch={this.handleTableClearSearch}
+            onSortChange={this.handleTableSortChange}
           />
         );
     }
@@ -522,7 +583,7 @@ export default class MonitorK8sNew extends Mixins(UserConfigMixin) {
             )}
           </K8sNavBar>
         </div>
-        <div class='monitor-k8s-new-header'>
+        <div class='monitor-k8s-new-header ____monitor-k8s-new-header'>
           {this.clusterLoading ? (
             <div class='skeleton-element cluster-skeleton' />
           ) : (
@@ -564,7 +625,12 @@ export default class MonitorK8sNew extends Mixins(UserConfigMixin) {
           </div>
         </div>
 
-        <div class='monitor-k8s-new-content'>
+        <div
+          style={{
+            height: `calc(100% - ${this.headerHeight}px)`,
+          }}
+          class='monitor-k8s-new-content'
+        >
           <div class='content-left'>
             <K8sLeftPanel>
               <K8sDimensionList
@@ -573,13 +639,14 @@ export default class MonitorK8sNew extends Mixins(UserConfigMixin) {
                 groupBy={this.groupFilters}
                 onClearFilterBy={this.clearFilterBy}
                 onDimensionTotal={this.dimensionTotalChange}
-                onDrillDown={this.handleDrillDown}
+                onDrillDown={this.handleTableGroupChange}
                 onFilterByChange={this.filterByChange}
                 onGroupByChange={this.groupByChange}
               />
               <K8sMetricList
                 activeMetric={this.activeMetricId}
-                hideMetrics={this.hideMetrics}
+                disabledMetricList={this.disabledMetricList}
+                hideMetrics={this.resultHideMetrics}
                 loading={this.metricLoading}
                 metricList={this.metricList}
                 onHandleItemClick={this.handleMetricItemClick}
